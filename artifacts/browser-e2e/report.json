@@ -1,0 +1,29 @@
+{
+  "chrome": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "initialStatus": "Start a single-player stage.",
+  "pausedTick": 411,
+  "forwardTick": 412,
+  "restoredHash": 3046003173,
+  "rightBranchHash": 4123616944,
+  "leftBranchHash": 7185729,
+  "reproducedRightHash": 4123616944,
+  "committedHash": 3705935847,
+  "replayEndHash": 3705935847,
+  "committedReplayLength": 57,
+  "halfSpeedTicksIn1200ms": 36,
+  "doubleSpeedTicksIn1200ms": 148,
+  "stateScrollViewport": {
+    "clientHeight": 210,
+    "scrollHeight": 499,
+    "overflowY": "auto"
+  },
+  "exportedReplay": "C:\\Users\\ouko_\\Documents\\Browser TAS Tools\\artifacts\\browser-e2e\\committed-branch.replay.json",
+  "pageErrors": [],
+  "consoleErrors": [
+    "Access to fetch at 'https://webmonkeyball-lobby.sndrec32exe.workers.dev/leaderboards/allowlist' from origin 'https://monkeyball-online.pages.dev' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource.",
+    "Failed to load resource: net::ERR_FAILED"
+  ],
+  "consoleWarnings": [
+    "<meta name=\"apple-mobile-web-app-capable\" content=\"yes\"> is deprecated. Please include <meta name=\"mobile-web-app-capable\" content=\"yes\">"
+  ]
+}

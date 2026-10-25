@@ -1,0 +1,21 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "redirect",
+      "redirect": {
+        "extensionPath": "/vendor/webmonkeyball-main.instrumented.v0.2.0.js"
+      }
+    },
+    "condition": {
+      "urlFilter": "||monkeyball-online.pages.dev/dist/main.js|",
+      "initiatorDomains": [
+        "monkeyball-online.pages.dev"
+      ],
+      "resourceTypes": [
+        "script"
+      ]
+    }
+  }
+]

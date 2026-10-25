@@ -1,0 +1,515 @@
+import type { Game, MultiplayerGameMode } from '../../game.js';
+import type { QuantizedInput } from '../../determinism.js';
+import type { FrameBundleMessage } from '../../netcode_protocol.js';
+import type { GameSource } from '../../shared/constants/index.js';
+import { hashSimStateBreakdown } from '../../sim_hash.js';
+
+type NetplayRole = 'host' | 'client';
+
+type NetplayStateDeps = {
+  game: Game;
+  setNetplayState: (state: any | null) => void;
+  getNetplayState: () => any | null;
+  getHostRelay: () => any | null;
+  getClientPeer: () => any | null;
+  setNetplayAccumulator: (value: number) => void;
+  normalizeMultiplayerGameMode: (mode: unknown) => MultiplayerGameMode;
+  getActiveGameSource: () => GameSource;
+  getStageBasePath: (gameSource: GameSource) => string;
+  getLobbyRoom: () => any;
+  maxRollback: number;
+  maxResend: number;
+  hashInterval: number;
+  netplayClientLead: number;
+  netplayClientMaxExtraLead: number;
+  stageReadyResendMs: number;
+  stageReadyTimeoutMs: number;
+};
+
+export class NetplayStateSyncController {
+  private readonly deps: NetplayStateDeps;
+  private static readonly HOST_STAGE_POST_SYNC_INACTIVITY_KICK_GRACE_MS = 10000;
+
+  constructor(deps: NetplayStateDeps) {
+    this.deps = deps;
+  }
+
+  private extendHostInactivityKickGrace(state: any, nowMs: number, durationMs: number) {
+    const clampedDurationMs = Math.max(0, Math.trunc(durationMs));
+    const next = nowMs + clampedDurationMs;
+    const current = Number(state.hostInactivityKickGraceUntilMs);
+    state.hostInactivityKickGraceUntilMs = Number.isFinite(current)
+      ? Math.max(current, next)
+      : next;
+  }
+
+  private getHostStageTransitionKickGraceMs() {
+    const stageReadyTimeoutMs = Math.max(0, Math.trunc(this.deps.stageReadyTimeoutMs));
+    return stageReadyTimeoutMs + NetplayStateSyncController.HOST_STAGE_POST_SYNC_INACTIVITY_KICK_GRACE_MS;
+  }
+
+  private clampInt(value: number, min: number, max: number) {
+    return Math.min(max, Math.max(min, Math.trunc(value)));
+  }
+
+  private createNetplayId() {
+    const buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    return buf[0] >>> 0;
+  }
+
+  quantizedEqual(a: QuantizedInput, b: QuantizedInput) {
+    return a.x === b.x && a.y === b.y && (a.buttons ?? 0) === (b.buttons ?? 0);
+  }
+
+  coerceFrame(value: unknown): number | null {
+    const num = Number(value);
+    if (!Number.isFinite(num)) {
+      return null;
+    }
+    return Math.max(0, Math.floor(num));
+  }
+
+  private clampQuantizedAxis(value: unknown): number {
+    const num = Number(value);
+    if (!Number.isFinite(num)) {
+      return 0;
+    }
+    return this.clampInt(Math.round(num), -127, 127);
+  }
+
+  normalizeInput(input: any): QuantizedInput | null {
+    if (!input || typeof input !== 'object') {
+      return null;
+    }
+    const buttonsNum = Number(input.buttons ?? 0);
+    return {
+      x: this.clampQuantizedAxis(input.x),
+      y: this.clampQuantizedAxis(input.y),
+      buttons: Number.isFinite(buttonsNum) ? (buttonsNum | 0) : 0,
+    };
+  }
+
+  ensureNetplayState(role: NetplayRole) {
+    const current = this.deps.getNetplayState();
+    if (current && current.role === role) {
+      return current;
+    }
+    const session = this.deps.game.ensureRollbackSession();
+    session.prime(this.deps.game.simTick);
+    this.deps.game.netplayRttMs = null;
+    const baseFrame = Math.max(-1, Math.floor(this.deps.game.simTick));
+    const next = {
+      role,
+      session,
+      inputHistory: new Map<number, Map<number, QuantizedInput>>(),
+      lastInputs: new Map<number, QuantizedInput>(),
+      pendingLocalInputs: new Map<number, QuantizedInput>(),
+      lastAckedLocalFrame: -1,
+      lastReceivedHostFrame: baseFrame,
+      hostFrameBuffer: new Map<number, FrameBundleMessage>(),
+      clientStates: new Map(),
+      maxRollback: this.deps.maxRollback,
+      maxResend: this.deps.maxResend,
+      hashInterval: this.deps.hashInterval,
+      hashHistory: new Map<number, number>(),
+      expectedHashes: new Map<number, number>(),
+      hashBreakdownHistory: new Map<number, {
+        ballsHash: number;
+        worldsHash: number;
+        stageHash: number;
+        detHash: number;
+        fullHash: number;
+      }>(),
+      expectedHashProbeByFrame: new Map<number, {
+        hash: number;
+        ballsHash: number;
+        worldsHash: number;
+        stageHash: number;
+        detHash: number;
+      }>(),
+      receivedHostFrames: new Set<number>(),
+      pendingHostFrameReceipts: new Set<number>(),
+      highestContiguousHostFrame: baseFrame,
+      debugHashMismatchCount: 0,
+      debugLastMismatchFrame: null,
+      debugLastMismatchLocalHash: null,
+      debugLastMismatchExpectedHash: null,
+      debugLastMismatchAtMs: null,
+      debugLastMismatchParts: null,
+      lastMismatchSignatureFrame: null,
+      lastMismatchSignatureExpectedHash: null,
+      lastMismatchSignatureLocalHash: null,
+      lastMismatchSignatureAtMs: null,
+      debugSnapshotRequestsMismatch: 0,
+      debugSnapshotRequestsLag: 0,
+      debugLastSnapshotRequestReason: null,
+      debugLastSnapshotRequestFrame: null,
+      debugLastSnapshotRequestAtMs: null,
+      debugSnapshotsReceived: 0,
+      debugSnapshotsApplied: 0,
+      debugSnapshotsDroppedStageSeq: 0,
+      debugSnapshotsDeferredStageId: 0,
+      debugLastSnapshotReceivedFrame: null,
+      debugLastSnapshotAppliedFrame: null,
+      debugLastSnapshotApplyResult: null,
+      lastAuthHashFrameSent: -1,
+      pendingHostUpdates: new Set<number>(),
+      lastHostFrameTimeMs: null,
+      lagBehindSinceMs: null,
+      lastSnapshotRequestTimeMs: null,
+      rttMs: null,
+      pingSeq: 0,
+      pendingPings: new Map<number, number>(),
+      lastPingTimeMs: 0,
+      currentStageId: null,
+      readyPlayers: new Set<number>(),
+      awaitingStageReady: false,
+      awaitingStageSync: false,
+      stageSeq: this.createNetplayId(),
+      stageReadySentMs: null,
+      stageReadyTimeoutMs: null,
+      hostInactivityKickGraceUntilMs: null,
+      currentCourse: null,
+      currentGameSource: null,
+      currentGameMode: null,
+      awaitingSnapshot: false,
+      pendingHostRollbackFrame: null,
+      pendingHostRollbackPlayers: new Set<number>(),
+    };
+    this.deps.setNetplayState(next);
+    return next;
+  }
+
+  resetNetplaySession() {
+    this.deps.game.rollbackSession = null;
+    const session = this.deps.game.ensureRollbackSession();
+    session.prime(this.deps.game.simTick);
+    const state = this.deps.getNetplayState();
+    if (state) {
+      state.session = session;
+    }
+  }
+
+  resetNetplayForStage() {
+    const state = this.deps.getNetplayState();
+    if (!state) {
+      return;
+    }
+    const baseFrame = Math.max(-1, Math.floor(this.deps.game.simTick));
+    state.inputHistory.clear();
+    state.lastInputs.clear();
+    state.pendingLocalInputs.clear();
+    state.hashHistory.clear();
+    state.expectedHashes.clear();
+    state.hashBreakdownHistory.clear();
+    state.expectedHashProbeByFrame.clear();
+    state.receivedHostFrames.clear();
+    state.pendingHostFrameReceipts.clear();
+    state.highestContiguousHostFrame = baseFrame;
+    state.debugHashMismatchCount = 0;
+    state.debugLastMismatchFrame = null;
+    state.debugLastMismatchLocalHash = null;
+    state.debugLastMismatchExpectedHash = null;
+    state.debugLastMismatchAtMs = null;
+    state.debugLastMismatchParts = null;
+    state.lastMismatchSignatureFrame = null;
+    state.lastMismatchSignatureExpectedHash = null;
+    state.lastMismatchSignatureLocalHash = null;
+    state.lastMismatchSignatureAtMs = null;
+    state.debugSnapshotRequestsMismatch = 0;
+    state.debugSnapshotRequestsLag = 0;
+    state.debugLastSnapshotRequestReason = null;
+    state.debugLastSnapshotRequestFrame = null;
+    state.debugLastSnapshotRequestAtMs = null;
+    state.debugSnapshotsReceived = 0;
+    state.debugSnapshotsApplied = 0;
+    state.debugSnapshotsDroppedStageSeq = 0;
+    state.debugSnapshotsDeferredStageId = 0;
+    state.debugLastSnapshotReceivedFrame = null;
+    state.debugLastSnapshotAppliedFrame = null;
+    state.debugLastSnapshotApplyResult = null;
+    state.lastAuthHashFrameSent = -1;
+    state.pendingHostUpdates.clear();
+    state.pendingPings.clear();
+    state.lastPingTimeMs = 0;
+    state.rttMs = null;
+    this.deps.game.netplayRttMs = null;
+    state.lastSnapshotRequestTimeMs = null;
+    state.lastHostFrameTimeMs = null;
+    state.lagBehindSinceMs = null;
+    state.awaitingSnapshot = false;
+    state.pendingHostRollbackFrame = null;
+    state.pendingHostRollbackPlayers.clear();
+    state.currentStageId = null;
+    state.readyPlayers.clear();
+    state.awaitingStageReady = false;
+    state.awaitingStageSync = false;
+    state.stageReadySentMs = null;
+    state.stageReadyTimeoutMs = null;
+    state.hostInactivityKickGraceUntilMs = null;
+    state.lastAckedLocalFrame = -1;
+    state.lastReceivedHostFrame = baseFrame;
+    state.hostFrameBuffer.clear();
+    for (const clientState of state.clientStates.values()) {
+      clientState.lastAckedHostFrame = -1;
+      clientState.lastAckedClientInput = baseFrame;
+      if (clientState.pendingClientInputReceipts?.clear) {
+        clientState.pendingClientInputReceipts.clear();
+      } else {
+        clientState.pendingClientInputReceipts = new Set<number>();
+      }
+      clientState.lastSnapshotMs = null;
+      clientState.lastSnapshotRequestMs = null;
+    }
+    state.session.prime(this.deps.game.simTick);
+    this.deps.setNetplayAccumulator(0);
+  }
+
+  private getExpectedStageReadyPlayers() {
+    return this.deps.game.players
+      .filter((player) => !player.pendingSpawn)
+      .map((player) => player.id);
+  }
+
+  maybeSendStageSync() {
+    const state = this.deps.getNetplayState();
+    const hostRelay = this.deps.getHostRelay();
+    if (!state || state.role !== 'host' || !hostRelay || !state.awaitingStageReady) {
+      return;
+    }
+    const expectedPlayers = this.getExpectedStageReadyPlayers();
+    if (!expectedPlayers.every((id) => state.readyPlayers.has(id))) {
+      return;
+    }
+    state.awaitingStageReady = false;
+    this.extendHostInactivityKickGrace(
+      state,
+      performance.now(),
+      NetplayStateSyncController.HOST_STAGE_POST_SYNC_INACTIVITY_KICK_GRACE_MS,
+    );
+    state.stageReadyTimeoutMs = null;
+    state.stageReadySentMs = null;
+    const frame = state.session.getFrame();
+    hostRelay.broadcast({
+      type: 'stage_sync',
+      stageSeq: state.stageSeq,
+      stageId: state.currentStageId ?? this.deps.game.stage?.stageId ?? 0,
+      frame,
+    });
+  }
+
+  sendStageSyncToClient(playerId: number) {
+    const state = this.deps.getNetplayState();
+    const hostRelay = this.deps.getHostRelay();
+    if (!state || state.role !== 'host' || !hostRelay || state.currentStageId === null) {
+      return;
+    }
+    hostRelay.sendTo(playerId, {
+      type: 'stage_sync',
+      stageSeq: state.stageSeq,
+      stageId: state.currentStageId,
+      frame: state.session.getFrame(),
+    });
+  }
+
+  initStageSync(stageId: number) {
+    const state = this.deps.getNetplayState();
+    if (!state) {
+      return;
+    }
+    state.currentStageId = stageId;
+    state.readyPlayers.clear();
+    state.readyPlayers.add(this.deps.game.localPlayerId);
+    state.awaitingStageReady = state.role === 'host';
+    state.awaitingStageSync = state.role === 'client';
+    const nowMs = performance.now();
+    state.stageReadySentMs = state.role === 'client' ? nowMs : null;
+    state.stageReadyTimeoutMs = state.role === 'host' ? nowMs : null;
+    if (state.role === 'host') {
+      this.extendHostInactivityKickGrace(state, nowMs, this.getHostStageTransitionKickGraceMs());
+      for (const clientState of state.clientStates.values()) {
+        if (!clientState) {
+          continue;
+        }
+        clientState.lastInboundMessageMs = nowMs;
+        clientState.timeoutKickSentMs = null;
+      }
+    } else {
+      state.hostInactivityKickGraceUntilMs = null;
+    }
+    if (state.role === 'client') {
+      this.deps.getClientPeer()?.send({
+        type: 'stage_ready',
+        stageSeq: state.stageSeq,
+        playerId: this.deps.game.localPlayerId,
+        stageId,
+      });
+    }
+    this.maybeSendStageSync();
+  }
+
+  markStageReady(stageId: number) {
+    const state = this.deps.getNetplayState();
+    if (!state) {
+      return;
+    }
+    state.currentStageId = stageId;
+    state.readyPlayers.add(this.deps.game.localPlayerId);
+    state.awaitingStageSync = false;
+    if (state.role === 'client') {
+      const nowMs = performance.now();
+      state.stageReadySentMs = nowMs;
+      this.deps.getClientPeer()?.send({
+        type: 'stage_ready',
+        stageSeq: state.stageSeq,
+        playerId: this.deps.game.localPlayerId,
+        stageId,
+      });
+    }
+    this.maybeSendStageSync();
+  }
+
+  maybeResendStageReady(nowMs: number) {
+    const state = this.deps.getNetplayState();
+    if (!state || state.role !== 'client' || !state.awaitingStageSync || state.currentStageId === null) {
+      return;
+    }
+    const lastSent = state.stageReadySentMs ?? 0;
+    if ((nowMs - lastSent) < this.deps.stageReadyResendMs) {
+      return;
+    }
+    state.stageReadySentMs = nowMs;
+    this.deps.getClientPeer()?.send({
+      type: 'stage_ready',
+      stageSeq: state.stageSeq,
+      playerId: this.deps.game.localPlayerId,
+      stageId: state.currentStageId,
+    });
+  }
+
+  maybeForceStageSync(nowMs: number) {
+    const state = this.deps.getNetplayState();
+    const hostRelay = this.deps.getHostRelay();
+    if (!state || state.role !== 'host' || !state.awaitingStageReady || !hostRelay) {
+      return;
+    }
+    const startedAt = state.stageReadyTimeoutMs ?? nowMs;
+    state.stageReadyTimeoutMs = startedAt;
+    if ((nowMs - startedAt) < this.deps.stageReadyTimeoutMs) {
+      return;
+    }
+    state.awaitingStageReady = false;
+    this.extendHostInactivityKickGrace(
+      state,
+      nowMs,
+      NetplayStateSyncController.HOST_STAGE_POST_SYNC_INACTIVITY_KICK_GRACE_MS,
+    );
+    state.stageReadyTimeoutMs = null;
+    state.stageReadySentMs = null;
+    const frame = state.session.getFrame();
+    hostRelay.broadcast({
+      type: 'stage_sync',
+      stageSeq: state.stageSeq,
+      stageId: state.currentStageId ?? this.deps.game.stage?.stageId ?? 0,
+      frame,
+    });
+  }
+
+  getSimHash() {
+    return this.getSimHashBreakdown().fullHash;
+  }
+
+  getSimHashBreakdown() {
+    const detHash = this.deps.game.getMultiplayerDeterminismHash() >>> 0;
+    if (!this.deps.game.stageRuntime || !this.deps.game.world) {
+      return {
+        ballsHash: 0,
+        worldsHash: 0,
+        stageHash: 0,
+        detHash,
+        fullHash: 0,
+      };
+    }
+    const players = this.deps.game.getPlayersSortedCached();
+    const balls = players.map((player) => player.ball);
+    const worlds = [this.deps.game.world, ...players.map((player) => player.world)];
+    const base = hashSimStateBreakdown(balls, worlds, this.deps.game.stageRuntime);
+    return {
+      ballsHash: base.ballsHash >>> 0,
+      worldsHash: base.worldsHash >>> 0,
+      stageHash: base.stageHash >>> 0,
+      detHash,
+      fullHash: (base.combinedHash ^ detHash) >>> 0,
+    };
+  }
+
+  private getAuthoritativeFrame(state: any) {
+    let authFrame = state.session.getFrame();
+    for (const player of this.deps.game.players) {
+      if (player.isSpectator || player.pendingSpawn || player.id === this.deps.game.localPlayerId) {
+        continue;
+      }
+      const clientState = state.clientStates.get(player.id);
+      if (!clientState) {
+        return -1;
+      }
+      authFrame = Math.min(authFrame, clientState.lastAckedClientInput);
+    }
+    return authFrame;
+  }
+
+  getAuthoritativeHashFrame(state: any) {
+    if (state.hashInterval <= 0) {
+      return null;
+    }
+    const authFrame = this.getAuthoritativeFrame(state);
+    if (authFrame < 0) {
+      return null;
+    }
+    const hashFrame = authFrame - (authFrame % state.hashInterval);
+    if (hashFrame < 0 || hashFrame <= state.lastAuthHashFrameSent) {
+      return null;
+    }
+    if (!state.hashHistory.has(hashFrame)) {
+      return null;
+    }
+    return hashFrame;
+  }
+
+  getEstimatedHostFrame(state: any) {
+    if (state.role !== 'client') {
+      return state.lastReceivedHostFrame;
+    }
+    if (state.lastHostFrameTimeMs === null) {
+      return state.lastReceivedHostFrame;
+    }
+    const elapsedSeconds = (performance.now() - state.lastHostFrameTimeMs) / 1000;
+    const maxAdvance = Math.max(1, state.maxRollback);
+    const advance = Math.min(elapsedSeconds / this.deps.game.fixedStep, maxAdvance);
+    return state.lastReceivedHostFrame + Math.max(0, advance);
+  }
+
+  private getIntroLeadScale() {
+    const total = this.deps.game.introTotalFrames ?? 0;
+    const remaining = this.deps.game.introTimerFrames ?? 0;
+    if (total <= 0 || remaining <= 0) {
+      return 1;
+    }
+    return Math.max(0, Math.min(1, 1 - (remaining / total)));
+  }
+
+  getClientLeadFrames(state: any) {
+    let lead = this.deps.netplayClientLead;
+    if (state.rttMs && state.rttMs > 0) {
+      const rttFrames = (state.rttMs / 1000) / this.deps.game.fixedStep;
+      const extra = Math.min(this.deps.netplayClientMaxExtraLead, Math.max(0, Math.floor(rttFrames * 0.5)));
+      lead += extra;
+    }
+    const scale = this.getIntroLeadScale();
+    if (scale >= 1) {
+      return lead;
+    }
+    return Math.max(0, Math.floor(lead * scale));
+  }
+}

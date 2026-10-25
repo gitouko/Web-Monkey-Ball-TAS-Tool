@@ -1,0 +1,6 @@
+node_modules/
+.research/
+artifacts/browser-e2e/extension-profile/
+artifacts/browser-e2e/vanilla-profile/
+artifacts/browser-e2e/failure.png
+artifacts/browser-e2e/failure.txt

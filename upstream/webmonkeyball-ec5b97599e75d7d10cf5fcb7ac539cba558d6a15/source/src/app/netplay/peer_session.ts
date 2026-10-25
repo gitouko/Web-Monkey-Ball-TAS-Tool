@@ -1,0 +1,400 @@
+import { HostRelay, ClientPeer, createHostOffer, applyHostSignal } from '../../netplay.js';
+import type { Game, MultiplayerGameMode } from '../../game.js';
+import type {
+  RoomInfo,
+  RoomGameModeOptions,
+  PlayerProfile,
+  ClientToHostMessage,
+  HostToClientMessage,
+  KickReasonCode,
+} from '../../netcode_protocol.js';
+import type { GameSource } from '../../shared/constants/index.js';
+import {
+  formatLobbyDisconnectStatus,
+  resolveSignalCloseDisconnectReason,
+  type LobbyDisconnectReason,
+} from './disconnect_reasons.js';
+
+type NetplayState = {
+  role: 'host' | 'client';
+  stageSeq: number;
+  session: { getFrame: () => number };
+  clientStates: Map<number, {
+    lastAckedHostFrame: number;
+    lastAckedClientInput: number;
+    pendingClientInputReceipts: Set<number>;
+    lastSnapshotMs: number | null;
+    lastSnapshotRequestMs: number | null;
+    lastInboundMessageMs: number;
+    timeoutKickSentMs: number | null;
+  }>;
+  currentCourse: any;
+  currentGameSource: GameSource | null;
+  currentGameMode: MultiplayerGameMode;
+};
+
+type LobbyRoom = RoomInfo;
+const CLIENT_CONNECT_TIMEOUT_MS = 10000;
+
+type PeerSessionDeps = {
+  lobbyClient: any;
+  lobbyStatus: HTMLElement | null;
+  game: Game;
+  chainedMaxPlayers: number;
+  lobbyMaxPlayers: number;
+  getLobbyRoom: () => LobbyRoom | null;
+  getLobbyHostToken: () => string | null;
+  getLobbySignalShouldReconnect: () => boolean;
+  setLobbySignalShouldReconnect: (enabled: boolean) => void;
+  getLobbySignal: () => { send: (msg: any) => void; close: () => void } | null;
+  setLobbySignal: (signal: { send: (msg: any) => void; close: () => void } | null) => void;
+  setLobbySignalReconnectFn: (fn: (() => void) | null) => void;
+  getLobbySignalReconnectFn: () => (() => void) | null;
+  clearLobbySignalRetry: () => void;
+  scheduleLobbySignalReconnect: () => void;
+  ensureNetplayState: (role: 'host' | 'client') => NetplayState;
+  getNetplayState: () => NetplayState | null;
+  setNetplayEnabled: (enabled: boolean) => void;
+  getRoomGameMode: (room: RoomInfo | null | undefined) => MultiplayerGameMode;
+  getRoomGameModeOptions: (room: RoomInfo | null | undefined, mode: MultiplayerGameMode) => RoomGameModeOptions;
+  applyGameModeOptionsToGame: (mode: MultiplayerGameMode, raw: unknown) => RoomGameModeOptions;
+  applyLocalProfileToSession: () => void;
+  normalizeMultiplayerGameMode: (mode: unknown) => MultiplayerGameMode;
+  shouldJoinAsSpectator: () => boolean;
+  markPlayerPendingSpawn: (playerId: number, stageSeq: number) => void;
+  profileFallbackForPlayer: (playerId: number) => PlayerProfile;
+  lobbyProfiles: Map<number, PlayerProfile>;
+  pendingAvatarByPlayer: Map<number, string>;
+  pendingSpawnStageSeq: Map<number, number>;
+  maybeSendStageSync: () => void;
+  getStageBasePath: (source: GameSource) => string;
+  sendSnapshotToClient: (playerId: number) => void;
+  broadcastRoomUpdate: () => void;
+  sendLobbyHeartbeat: (nowMs: number, force?: boolean) => void;
+  updateLobbyUi: () => void;
+  startLobbyHeartbeat: (roomId: string) => void;
+  broadcastLocalProfile: () => void;
+  sendStoredProfileToPeer: (targetPlayerId: number, sourcePlayerId: number, profile: PlayerProfile) => void;
+  handleClientMessage: (playerId: number, msg: ClientToHostMessage) => void;
+  handleHostMessage: (msg: HostToClientMessage) => void;
+  handleHostDisconnect: (reason?: LobbyDisconnectReason) => Promise<void>;
+  getHostRelay: () => HostRelay | null;
+  setHostRelay: (relay: HostRelay | null) => void;
+  getClientPeer: () => ClientPeer | null;
+  setClientPeer: (peer: ClientPeer | null) => void;
+};
+
+export class PeerSessionController {
+  private readonly deps: PeerSessionDeps;
+
+  constructor(deps: PeerSessionDeps) {
+    this.deps = deps;
+  }
+
+  private capRoomMaxPlayers(mode: MultiplayerGameMode, requestedMaxPlayers: number) {
+    const cap = mode === 'chained_together' ? this.deps.chainedMaxPlayers : this.deps.lobbyMaxPlayers;
+    return Math.max(1, Math.min(requestedMaxPlayers, cap));
+  }
+
+  private setDisconnectStatus(reason: LobbyDisconnectReason) {
+    if (!this.deps.lobbyStatus) {
+      return;
+    }
+    this.deps.lobbyStatus.textContent = formatLobbyDisconnectStatus(reason);
+  }
+
+  rejectHostConnection(playerId: number, reasonCode: KickReasonCode = 'kick_room_full', reason?: string) {
+    const reasonText = reason ?? (
+      reasonCode === 'kick_host_unavailable'
+        ? 'Host unavailable'
+        : reasonCode === 'kick_client_inactivity_timeout'
+          ? 'Disconnected: timed out (no client messages)'
+          : reasonCode === 'kick_removed_by_host'
+            ? 'Removed by host'
+            : 'Room is full'
+    );
+    this.deps.getHostRelay()?.sendTo(playerId, { type: 'kick', reasonCode, reason: reasonText });
+    window.setTimeout(() => {
+      this.deps.getHostRelay()?.disconnect(playerId);
+    }, 80);
+    const lobbyRoom = this.deps.getLobbyRoom();
+    const lobbyHostToken = this.deps.getLobbyHostToken();
+    if (this.deps.lobbyClient && lobbyRoom && lobbyHostToken) {
+      void this.deps.lobbyClient.kickPlayer(lobbyRoom.roomId, lobbyHostToken, playerId).catch(() => {
+        // Ignore backend kick failures.
+      });
+    }
+  }
+
+  startHost(room: LobbyRoom, playerToken: string) {
+    if (!this.deps.lobbyClient) {
+      return;
+    }
+    if (!playerToken) {
+      if (this.deps.lobbyStatus) {
+        this.deps.lobbyStatus.textContent = 'Lobby: auth failed';
+      }
+      return;
+    }
+    this.deps.setNetplayEnabled(true);
+    const state = this.deps.ensureNetplayState('host');
+    const roomMode = this.deps.getRoomGameMode(room);
+    const roomModeOptions = this.deps.getRoomGameModeOptions(room, roomMode);
+    state.currentGameMode = roomMode;
+    this.deps.game.setLocalPlayerId(room.hostId);
+    this.deps.applyLocalProfileToSession();
+    const cappedMaxPlayers = this.capRoomMaxPlayers(roomMode, room.settings.maxPlayers);
+    room.settings.maxPlayers = cappedMaxPlayers;
+    this.deps.game.maxPlayers = cappedMaxPlayers;
+    this.deps.game.playerCollisionEnabled = room.settings.collisionEnabled;
+    this.deps.game.infiniteTimeEnabled = !!(room.settings.infiniteTimeEnabled ?? false);
+    this.deps.game.setMultiplayerGameMode(roomMode);
+    this.deps.applyGameModeOptionsToGame(roomMode, roomModeOptions);
+    this.deps.game.allowCourseAdvance = true;
+
+    const hostRelay = new HostRelay((playerId, msg) => {
+      this.deps.handleClientMessage(playerId, msg);
+    });
+    this.deps.setHostRelay(hostRelay);
+    hostRelay.hostId = room.hostId;
+
+    hostRelay.onConnect = (playerId) => {
+      const liveState = this.deps.getNetplayState();
+      if (!liveState) {
+        this.rejectHostConnection(playerId, 'kick_host_unavailable', 'Host unavailable');
+        return;
+      }
+      if (this.deps.game.players.length >= this.deps.game.maxPlayers) {
+        this.rejectHostConnection(playerId, 'kick_room_full', 'Room is full');
+        return;
+      }
+      if (!liveState.clientStates.has(playerId)) {
+        const baseFrame = Number.isFinite(liveState.session?.getFrame?.())
+          ? Math.floor(liveState.session.getFrame())
+          : -1;
+        liveState.clientStates.set(playerId, {
+          lastAckedHostFrame: -1,
+          lastAckedClientInput: baseFrame,
+          pendingClientInputReceipts: new Set<number>(),
+          lastSnapshotMs: null,
+          lastSnapshotRequestMs: null,
+          lastInboundMessageMs: performance.now(),
+          timeoutKickSentMs: null,
+        });
+      }
+      const joinAsSpectator = this.deps.shouldJoinAsSpectator();
+      this.deps.game.addPlayer(playerId, { spectator: joinAsSpectator });
+      const player = this.deps.game.players.find((p) => p.id === playerId);
+      if (joinAsSpectator) {
+        this.deps.markPlayerPendingSpawn(playerId, liveState.stageSeq);
+      }
+      const pendingSpawn = !!player?.pendingSpawn;
+      if (!this.deps.lobbyProfiles.has(playerId)) {
+        this.deps.lobbyProfiles.set(playerId, this.deps.profileFallbackForPlayer(playerId));
+      }
+      for (const existing of this.deps.game.players) {
+        hostRelay.sendTo(playerId, {
+          type: 'player_join',
+          playerId: existing.id,
+          stageSeq: liveState.stageSeq,
+          spectator: existing.isSpectator,
+          pendingSpawn: existing.pendingSpawn,
+        });
+      }
+      hostRelay.broadcast({
+        type: 'player_join',
+        playerId,
+        stageSeq: liveState.stageSeq,
+        spectator: joinAsSpectator,
+        pendingSpawn,
+      });
+      const nextRoom = this.deps.getLobbyRoom() ?? room;
+      if (nextRoom) {
+        nextRoom.playerCount = this.deps.game.players.length;
+        hostRelay.sendTo(playerId, { type: 'room_update', room: nextRoom });
+      }
+      for (const [id, profile] of this.deps.lobbyProfiles.entries()) {
+        this.deps.sendStoredProfileToPeer(playerId, id, profile);
+      }
+      if (liveState.currentCourse && liveState.currentGameSource) {
+        const liveMode = this.deps.normalizeMultiplayerGameMode(liveState.currentGameMode);
+        const liveModeOptions = this.deps.getRoomGameModeOptions(this.deps.getLobbyRoom() ?? nextRoom, liveMode);
+        hostRelay.sendTo(playerId, {
+          type: 'start',
+          stageSeq: liveState.stageSeq,
+          gameSource: liveState.currentGameSource,
+          gameMode: liveMode,
+          gameModeOptions: Object.keys(liveModeOptions).length > 0 ? liveModeOptions : undefined,
+          course: liveState.currentCourse,
+          stageBasePath: this.deps.getStageBasePath(liveState.currentGameSource),
+          lateJoin: joinAsSpectator,
+        });
+      }
+      this.deps.sendSnapshotToClient(playerId);
+      this.deps.broadcastRoomUpdate();
+      this.deps.sendLobbyHeartbeat(performance.now(), true);
+      this.deps.updateLobbyUi();
+    };
+
+    hostRelay.onDisconnect = (playerId) => {
+      this.deps.game.removePlayer(playerId);
+      this.deps.getNetplayState()?.clientStates.delete(playerId);
+      this.deps.lobbyProfiles.delete(playerId);
+      this.deps.pendingAvatarByPlayer.delete(playerId);
+      this.deps.pendingSpawnStageSeq.delete(playerId);
+      hostRelay.broadcast({ type: 'player_leave', playerId });
+      this.deps.broadcastRoomUpdate();
+      this.deps.sendLobbyHeartbeat(performance.now(), true);
+      this.deps.updateLobbyUi();
+      this.deps.maybeSendStageSync();
+    };
+
+    this.deps.setLobbySignalShouldReconnect(true);
+    this.deps.clearLobbySignalRetry();
+    this.deps.setLobbySignalReconnectFn(() => {
+      this.deps.getLobbySignal()?.close();
+      const signal = this.deps.lobbyClient.openSignal(room.roomId, room.hostId, playerToken, async (msg: any) => {
+        const from = Number(msg?.from);
+        if (!Number.isFinite(from) || from <= 0 || msg.to !== room.hostId || from === room.hostId) {
+          return;
+        }
+        if (!msg.payload || typeof msg.payload !== 'object') {
+          return;
+        }
+        const senderId = Math.trunc(from);
+        if (msg.payload?.join) {
+          const offer = await createHostOffer(hostRelay, senderId);
+          hostRelay.onSignal?.({ type: 'signal', from: room.hostId, to: senderId, payload: { sdp: offer } });
+          return;
+        }
+        await applyHostSignal(hostRelay, senderId, msg.payload);
+      }, (closeInfo) => {
+        if (!this.deps.getLobbySignalShouldReconnect()) {
+          return;
+        }
+        this.setDisconnectStatus(resolveSignalCloseDisconnectReason(closeInfo));
+        this.deps.scheduleLobbySignalReconnect();
+      });
+      this.deps.setLobbySignal(signal);
+    });
+
+    this.deps.getLobbySignalReconnectFn()?.();
+    hostRelay.onSignal = (signal) => this.deps.getLobbySignal()?.send(signal);
+    // Sync host lobby UI (including room-name input) before first forced heartbeat.
+    // This preserves creation-time roomName metadata instead of overwriting it with blank input state.
+    this.deps.updateLobbyUi();
+    this.deps.startLobbyHeartbeat(room.roomId);
+    if (this.deps.lobbyStatus) {
+      this.deps.lobbyStatus.textContent = 'Lobby: hosting';
+    }
+    this.deps.broadcastLocalProfile();
+  }
+
+  async startClient(room: LobbyRoom, playerId: number, playerToken: string) {
+    if (!this.deps.lobbyClient) {
+      throw new Error('lobby_unavailable');
+    }
+    if (!playerToken) {
+      if (this.deps.lobbyStatus) {
+        this.deps.lobbyStatus.textContent = 'Lobby: auth failed';
+      }
+      throw new Error('auth_failed');
+    }
+    const state = this.deps.ensureNetplayState('client');
+    const roomMode = this.deps.getRoomGameMode(room);
+    const roomModeOptions = this.deps.getRoomGameModeOptions(room, roomMode);
+    state.currentGameMode = roomMode;
+    this.deps.game.setLocalPlayerId(playerId);
+    this.deps.applyLocalProfileToSession();
+    const cappedMaxPlayers = this.capRoomMaxPlayers(roomMode, room.settings.maxPlayers);
+    room.settings.maxPlayers = cappedMaxPlayers;
+    this.deps.game.maxPlayers = cappedMaxPlayers;
+    this.deps.game.playerCollisionEnabled = room.settings.collisionEnabled;
+    this.deps.game.infiniteTimeEnabled = !!(room.settings.infiniteTimeEnabled ?? false);
+    this.deps.game.setMultiplayerGameMode(roomMode);
+    this.deps.applyGameModeOptionsToGame(roomMode, roomModeOptions);
+    this.deps.game.allowCourseAdvance = false;
+    this.deps.game.addPlayer(room.hostId, { spectator: false });
+
+    const clientPeer = new ClientPeer((msg) => {
+      this.deps.handleHostMessage(msg);
+    });
+    this.deps.setClientPeer(clientPeer);
+    clientPeer.playerId = playerId;
+    clientPeer.hostId = room.hostId;
+    let connectionEstablished = false;
+    let connectionSettled = false;
+    let connectionTimeout: number | null = null;
+    let resolveConnection: (() => void) | null = null;
+    let rejectConnection: ((reason?: unknown) => void) | null = null;
+    const settleConnection = (error: Error | null) => {
+      if (connectionSettled) {
+        return;
+      }
+      connectionSettled = true;
+      if (connectionTimeout !== null) {
+        window.clearTimeout(connectionTimeout);
+        connectionTimeout = null;
+      }
+      if (error) {
+        rejectConnection?.(error);
+        return;
+      }
+      resolveConnection?.();
+    };
+    const connectedPromise = new Promise<void>((resolve, reject) => {
+      resolveConnection = resolve;
+      rejectConnection = reject;
+    });
+
+    clientPeer.onConnect = () => {
+      connectionEstablished = true;
+      this.deps.setNetplayEnabled(true);
+      this.deps.broadcastLocalProfile();
+      settleConnection(null);
+    };
+    clientPeer.onDisconnect = (detail) => {
+      if (!connectionEstablished) {
+        settleConnection(new Error('connect_failed'));
+        return;
+      }
+      void this.deps.handleHostDisconnect({ code: 'host_peer_disconnect', detail });
+    };
+    await clientPeer.createConnection();
+
+    this.deps.setLobbySignalShouldReconnect(true);
+    this.deps.clearLobbySignalRetry();
+    this.deps.setLobbySignalReconnectFn(() => {
+      this.deps.getLobbySignal()?.close();
+      const signal = this.deps.lobbyClient.openSignal(room.roomId, playerId, playerToken, async (msg: any) => {
+        if (msg.to !== playerId || msg.from !== room.hostId) {
+          return;
+        }
+        if (!msg.payload || typeof msg.payload !== 'object') {
+          return;
+        }
+        await clientPeer.handleSignal(msg.payload);
+      }, (closeInfo) => {
+        if (!this.deps.getLobbySignalShouldReconnect()) {
+          return;
+        }
+        this.setDisconnectStatus(resolveSignalCloseDisconnectReason(closeInfo));
+        this.deps.scheduleLobbySignalReconnect();
+      });
+      this.deps.setLobbySignal(signal);
+    });
+
+    this.deps.getLobbySignalReconnectFn()?.();
+    clientPeer.onSignal = (signal) => this.deps.getLobbySignal()?.send(signal);
+    connectionTimeout = window.setTimeout(() => {
+      settleConnection(new Error('connect_timeout'));
+    }, CLIENT_CONNECT_TIMEOUT_MS);
+    this.deps.getLobbySignal()?.send({ type: 'signal', from: playerId, to: room.hostId, payload: { join: true } });
+    await connectedPromise;
+    this.deps.startLobbyHeartbeat(room.roomId);
+    if (this.deps.lobbyStatus) {
+      this.deps.lobbyStatus.textContent = 'Lobby: connected';
+    }
+    this.deps.updateLobbyUi();
+  }
+}

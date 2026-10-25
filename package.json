@@ -1,0 +1,21 @@
+{
+  "name": "web-monkey-ball-tas-tools",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Manifest V3 TAS prototype for the production WebMonkeyBall build.",
+  "scripts": {
+    "sync:upstream": "node scripts/sync-upstream.mjs",
+    "sync:font": "node scripts/sync-font.mjs",
+    "build": "node scripts/build-extension.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:browser": "node tests/browser-e2e.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "playwright": "1.63.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

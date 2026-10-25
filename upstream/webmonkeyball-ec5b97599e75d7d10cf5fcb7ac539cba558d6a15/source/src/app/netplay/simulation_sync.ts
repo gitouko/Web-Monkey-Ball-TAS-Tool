@@ -1,0 +1,227 @@
+import type { Game } from '../../game.js';
+import type { QuantizedInput } from '../../determinism.js';
+
+type SimulationDeps = {
+  game: Game;
+  getNetplayState: () => any | null;
+  getPendingSnapshot: () => any | null;
+  setPendingSnapshot: (snapshot: any | null) => void;
+  getSimHash: () => number;
+  resetNetplaySession: () => void;
+  quantizedEqual: (a: QuantizedInput, b: QuantizedInput) => boolean;
+};
+
+export class NetplaySimulationSyncController {
+  private readonly deps: SimulationDeps;
+
+  constructor(deps: SimulationDeps) {
+    this.deps = deps;
+  }
+
+  recordInputForFrame(frame: number, playerId: number, input: QuantizedInput) {
+    const state = this.deps.getNetplayState();
+    if (!state) {
+      return false;
+    }
+    let frameInputs = state.inputHistory.get(frame);
+    if (!frameInputs) {
+      frameInputs = new Map();
+      state.inputHistory.set(frame, frameInputs);
+    }
+    const prev = frameInputs.get(playerId);
+    if (prev && this.deps.quantizedEqual(prev, input)) {
+      return false;
+    }
+    frameInputs.set(playerId, input);
+    state.lastInputs.set(playerId, input);
+    return true;
+  }
+
+  buildInputsForFrame(frame: number) {
+    const state = this.deps.getNetplayState();
+    if (!state) {
+      return new Map<number, QuantizedInput>();
+    }
+    let frameInputs = state.inputHistory.get(frame);
+    if (!frameInputs) {
+      frameInputs = new Map();
+      state.inputHistory.set(frame, frameInputs);
+    }
+    for (const player of this.deps.game.players) {
+      if (!frameInputs.has(player.id)) {
+        const last = state.lastInputs.get(player.id) ?? { x: 0, y: 0, buttons: 0 };
+        frameInputs.set(player.id, last);
+      }
+    }
+    return frameInputs;
+  }
+
+  private trimFrameMap(map: Map<number, unknown>, minFrame: number) {
+    for (const key of map.keys()) {
+      if (key < minFrame) {
+        map.delete(key);
+      }
+    }
+  }
+
+  private trimFrameSet(set: Set<number> | null | undefined, minFrame: number) {
+    if (!set?.keys || !set.delete) {
+      return;
+    }
+    for (const key of set.keys()) {
+      if (key < minFrame) {
+        set.delete(key);
+      }
+    }
+  }
+
+  trimNetplayHistory(frame: number) {
+    const state = this.deps.getNetplayState();
+    if (!state) {
+      return;
+    }
+    const minFrame = frame - state.maxRollback;
+    this.trimFrameMap(state.inputHistory, minFrame);
+    this.trimFrameMap(state.hashHistory, minFrame);
+    this.trimFrameMap(state.expectedHashes, minFrame);
+    this.trimFrameMap(state.hashBreakdownHistory, minFrame);
+    this.trimFrameMap(state.expectedHashProbeByFrame, minFrame);
+    this.trimFrameSet(state.receivedHostFrames, minFrame);
+    this.trimFrameSet(state.pendingHostFrameReceipts, minFrame);
+  }
+
+  rollbackAndResim(startFrame: number) {
+    const state = this.deps.getNetplayState();
+    if (!state) {
+      return false;
+    }
+    const session = state.session;
+    const current = session.getFrame();
+    const rollbackFrame = Math.max(0, startFrame - 1);
+    if (!session.rollbackTo(rollbackFrame)) {
+      return false;
+    }
+    const prevSuppress = session.suppressVisuals;
+    session.suppressVisuals = true;
+    try {
+      for (let frame = rollbackFrame + 1; frame <= current; frame += 1) {
+        const inputs = this.buildInputsForFrame(frame);
+        session.advanceTo(frame, inputs);
+        let hash: number | undefined;
+        if (state.hashInterval > 0 && frame % state.hashInterval === 0) {
+          hash = this.deps.getSimHash();
+          state.hashHistory.set(frame, hash);
+        }
+        if (state.role === 'host') {
+          const bundleInputs: Record<number, QuantizedInput> = {};
+          for (const [playerId, input] of inputs.entries()) {
+            bundleInputs[playerId] = input;
+          }
+          state.hostFrameBuffer.set(frame, {
+            type: 'frame',
+            stageSeq: state.stageSeq,
+            frame,
+            inputs: bundleInputs,
+          });
+        }
+        this.trimNetplayHistory(frame);
+      }
+    } finally {
+      session.suppressVisuals = prevSuppress;
+    }
+    return true;
+  }
+
+  private resimFromSnapshot(snapshotFrame: number, targetFrame: number) {
+    const state = this.deps.getNetplayState();
+    if (!state) {
+      return;
+    }
+    if (targetFrame <= snapshotFrame) {
+      return;
+    }
+    const session = state.session;
+    const prevSuppress = session.suppressVisuals;
+    session.suppressVisuals = true;
+    try {
+      for (let frame = snapshotFrame + 1; frame <= targetFrame; frame += 1) {
+        const inputs = this.buildInputsForFrame(frame);
+        session.advanceTo(frame, inputs);
+        if (state.hashInterval > 0 && frame % state.hashInterval === 0) {
+          state.hashHistory.set(frame, this.deps.getSimHash());
+        }
+        this.trimNetplayHistory(frame);
+      }
+    } finally {
+      session.suppressVisuals = prevSuppress;
+    }
+  }
+
+  tryApplyPendingSnapshot(stageId: number) {
+    const pendingSnapshot = this.deps.getPendingSnapshot();
+    if (!pendingSnapshot) {
+      return;
+    }
+    const state = this.deps.getNetplayState();
+    if (state && pendingSnapshot.stageSeq !== undefined && pendingSnapshot.stageSeq !== state.stageSeq) {
+      state.debugSnapshotsDroppedStageSeq = (state.debugSnapshotsDroppedStageSeq ?? 0) + 1;
+      state.debugLastSnapshotApplyResult = 'dropped_stage_seq';
+      this.deps.setPendingSnapshot(null);
+      return;
+    }
+    if (pendingSnapshot.stageId !== undefined && pendingSnapshot.stageId !== stageId) {
+      if (state) {
+        state.debugSnapshotsDeferredStageId = (state.debugSnapshotsDeferredStageId ?? 0) + 1;
+        state.debugLastSnapshotApplyResult = 'deferred_stage_id';
+      }
+      return;
+    }
+    const targetFrame = state?.session.getFrame() ?? this.deps.game.simTick;
+    const snapshotFrame = pendingSnapshot.frame;
+    const prevContiguous = state && Number.isFinite(state.highestContiguousHostFrame)
+      ? Math.floor(state.highestContiguousHostFrame)
+      : -1;
+    this.deps.game.loadRollbackState(pendingSnapshot.state);
+    this.deps.resetNetplaySession();
+    if (state) {
+      state.lastReceivedHostFrame = Math.max(state.lastReceivedHostFrame, snapshotFrame);
+      state.awaitingSnapshot = false;
+      state.hashHistory.clear();
+      state.hashBreakdownHistory?.clear?.();
+      const contiguous = Math.max(prevContiguous, Math.max(-1, snapshotFrame | 0));
+      for (const key of state.receivedHostFrames?.keys?.() ?? []) {
+        if (key <= contiguous) {
+          state.receivedHostFrames.delete(key);
+        }
+      }
+      for (const key of state.pendingHostFrameReceipts?.keys?.() ?? []) {
+        if (key <= contiguous) {
+          state.pendingHostFrameReceipts.delete(key);
+        }
+      }
+      state.highestContiguousHostFrame = contiguous;
+      state.lastMismatchSignatureFrame = null;
+      state.lastMismatchSignatureExpectedHash = null;
+      state.lastMismatchSignatureLocalHash = null;
+      state.lastMismatchSignatureAtMs = null;
+      for (const key of state.expectedHashes.keys()) {
+        if (key <= snapshotFrame) {
+          state.expectedHashes.delete(key);
+        }
+      }
+      for (const key of state.expectedHashProbeByFrame?.keys?.() ?? []) {
+        if (key <= snapshotFrame) {
+          state.expectedHashProbeByFrame.delete(key);
+        }
+      }
+      state.debugSnapshotsApplied = (state.debugSnapshotsApplied ?? 0) + 1;
+      state.debugLastSnapshotAppliedFrame = snapshotFrame;
+      state.debugLastSnapshotApplyResult = 'applied';
+    }
+    this.resimFromSnapshot(snapshotFrame, targetFrame);
+    if (state) {
+      state.lagBehindSinceMs = null;
+    }
+    this.deps.setPendingSnapshot(null);
+  }
+}

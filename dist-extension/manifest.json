@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Web-Monkey Ball ~ TAS Tools",
+  "version": "0.2.0",
+  "description": "Speed, exact frame advance, rewind, and replay-safe save states for WebMonkeyBall.",
+  "permissions": [
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": [
+    "https://monkeyball-online.pages.dev/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://monkeyball-online.pages.dev/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "webmonkeyball_bridge",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "vendor/webmonkeyball-main.instrumented.v0.2.0.js",
+        "assets/oxanium-variable.ttf"
+      ],
+      "matches": [
+        "https://monkeyball-online.pages.dev/*"
+      ]
+    }
+  ]
+}

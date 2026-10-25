@@ -1,0 +1,8 @@
+{
+  "extensionVersion": "0.2.0",
+  "instrumentedResource": "vendor/webmonkeyball-main.instrumented.v0.2.0.js",
+  "upstreamCommit": "ec5b97599e75d7d10cf5fcb7ac539cba558d6a15",
+  "expectedProductionBundleSha256": "598c7a561f4c6cf1bce90741f507735b7d5258106cb779e07ddc5d51893abfa6",
+  "instrumentedBundleSha256": "84ec3aafaaf9993a3086908644bbe0396bfbc60cb6a08a65af878ba21e9bf858",
+  "contentSha256": "e4989240c436a51a1cf6b928ce86cae7d8202afca63f846c77549f135454a548"
+}
